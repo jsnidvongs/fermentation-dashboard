@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apps Script web app test</title>
+<style>body{font:16px system-ui;max-width:640px;margin:2rem auto;padding:0 1rem}input,button{font:inherit;padding:.5rem;width:100%;box-sizing:border-box;margin:.25rem 0}pre{background:#f3f3f3;padding:1rem;overflow:auto;white-space:pre-wrap}</style>
+<h1>Web app test</h1>
+<p>Open this from GitHub Pages (or any https origin) to test real cross-site behaviour. Nothing is stored.</p>
+<input id="url" placeholder="Web app URL (ends in /exec)">
+<input id="tok" type="password" placeholder="DASH_TOKEN">
+<button onclick="go('ping')">Ping (POST, token)</button>
+<button onclick="go('status')">Status</button>
+<button onclick="go('read', {table:'Pills'})">Read Pills</button>
+<pre id="out">Waiting.</pre>
+<script>
+async function go(action, extra) {
+  const out = document.getElementById('out');
+  out.textContent = 'Working...';
+  const t0 = performance.now();
+  try {
+    const res = await fetch(document.getElementById('url').value.trim(), {
+      method: 'POST',
+      // text/plain keeps this a "simple" request, so the browser sends no preflight.
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(Object.assign({ token: document.getElementById('tok').value, action }, extra || {})),
+      redirect: 'follow'
+    });
+    const text = await res.text();
+    out.textContent = 'HTTP ' + res.status + ' in ' + Math.round(performance.now() - t0) + ' ms\n\n' + text.slice(0, 3000);
+  } catch (e) {
+    out.textContent = 'Failed: ' + e + '\nUsually a wrong URL, a deployment not set to "Anyone", or a blocked redirect.';
+  }
+}
+</script>

@@ -61,6 +61,7 @@ tr.grp td{background:var(--chip);font-weight:500}
 dialog{max-height:90vh;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);width:min(94vw,520px);padding:1rem}
 dialog::backdrop{background:rgba(17,24,39,.4)}
 .dt{display:flex;gap:.3rem}.dt>*{flex:1 1 0;min-width:0}
+.tag{display:inline-block;padding:.05rem .6rem;border-radius:999px;background:#fff;border:1px solid var(--line);color:var(--fg);font:500 .74rem/1.65 var(--sans);margin:.1rem .25rem .1rem 0;white-space:nowrap}
 .bar{height:.55rem;background:var(--sg);border-radius:2px;min-width:2px}
 .legend span{display:inline-flex;align-items:center;gap:.35rem;margin-right:.9rem;font:400 .7rem var(--mono);color:var(--muted)}
 .legend i{width:.9rem;height:.25rem;display:inline-block;border-radius:2px}
@@ -88,20 +89,45 @@ const LS = 'cd_ferm_cfg';
 const cfg = JSON.parse(localStorage.getItem(LS) || '{}'); // { url, token, name }
 const saveCfg = () => localStorage.setItem(LS, JSON.stringify(cfg));
 const TZ = 'Asia/Bangkok';
+const SERVER_VERSION = '2026-10-05.3'; // the Code.gs version this page expects
 const NAV = [['today', 'Today'], ['all', 'All batches'], ['trends', 'Trends'], ['import', 'Data quality'], ['settings', 'Settings']];
 
 async function api(action, body) {
   if (!cfg.url || !cfg.token) throw new Error('Not connected. Open Settings and enter the web app URL and token.');
-  const res = await fetch(cfg.url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // simple request: no CORS preflight
-    body: JSON.stringify(Object.assign({ token: cfg.token, action }, body || {})),
-    redirect: 'follow'
-  });
-  const j = await res.json();
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 45000);
+  let j;
+  try {
+    const res = await fetch(cfg.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // simple request: no CORS preflight
+      body: JSON.stringify(Object.assign({ token: cfg.token, action }, body || {})),
+      redirect: 'follow', signal: ctl.signal
+    });
+    const text = await res.text();
+    try { j = JSON.parse(text); }
+    catch (pe) { const t = (/<title>([^<]*)<\/title>/i.exec(text) || [])[1]; throw new Error('The web app sent back a web page instead of data' + (t ? ' (page title: "' + t.trim().slice(0, 80) + '")' : '') + '. Usual causes: the deployment is not set to "Anyone", the URL is from an old deployment, or Apps Script needs to be authorised again.'); }
+  } catch (e) {
+    if (/web app sent back a web page/.test(e.message)) throw e;
+    throw new Error(e.name === 'AbortError' ? 'The Sheet took too long to answer. Try Refresh.' : 'Could not reach the Sheet (' + e.message + '). Check the web app URL in Settings.');
+  } finally { clearTimeout(timer); }
   if (!j.ok) throw new Error(j.error || 'Request failed');
+  if (j.data === undefined) throw new Error('The server sent an empty reply to "' + action + '"' + (body && body.table ? ' (' + body.table + ')' : '') + '. Redeploy the Apps Script as a new version.');
   return j.data;
 }
+
+/* ============ colour tags: the same rules as the conditional formatting on the Batches tab of the 2026/27 Sheet ============ */
+// Each rule is "text contains": the first match wins, case-insensitive, exactly as in Google Sheets. A value with no match stays white.
+// Jamian (the spelling in the Lists tab) is given the same colour as Jamnian.
+const TAG_RULES = {
+  spirit: [['Blanc', '#B6D7A8'], ['Jamnian', '#DD7E6B'], ['Jamian', '#DD7E6B'], ['Thung Set', '#FFD966'], ['Mae Win', '#9FC5E8'], ['Test Batch', '#B4A7D6'], ['High Ester', '#6FA8DC']],
+  farm: [['Mae Win', '#A4C2F4'], ['Jamnian', '#DD7E6B'], ['Jamian', '#DD7E6B'], ['Don Pao', '#6AA84F'], ['Thung Seti', '#FFD966'], ['Bad Kad', '#674EA7'], ['Rung Arung', '#46BDC6']],
+  variety: [['Yak Kiew', '#93C47D'], ['50', '#FFD966']],
+  yeast: [['RM', '#F6B26B'], ['Wild', '#6D9EEB']]
+};
+const tagCol = (kind, v) => { const x = (TAG_RULES[kind] || []).find(r => String(v).toLowerCase().indexOf(r[0].toLowerCase()) >= 0); return x ? [x[1], '#000000'] : null; };
+const tagCss = (kind, v) => { const c = tagCol(kind, v); return c ? `background:${c[0]};color:${c[1]}` : ''; };
+const tag = (kind, v) => (v === '' || v == null) ? '' : `<span class="tag" style="${tagCss(kind, v)}">${esc(v)}</span>`;
+const TAG_KINDS = ['spirit', 'farm', 'variety', 'yeast'];
 
 /* ============ small helpers ============ */
 const $ = s => document.querySelector(s);
@@ -123,13 +149,19 @@ const S = { batches: [], readings: [], interventions: [], telemetry: [], pills: 
 async function load() {
   try {
     S.error = null;
-    const rd = (table, limit) => api('read', { table, limit }).then(r => r.rows);
-    const [batches, readings, interventions, telemetry, pills, alerts, settings, lists, season, status, editLog] = await Promise.all([
-      rd('Batches'), rd('Readings'), rd('Interventions'), rd('Telemetry', 20000), rd('Pills'), rd('Alerts'), rd('Settings'), rd('Lists'), rd('Season 2025-26'), api('status'), rd('Edit Log').catch(() => [])
-    ]);
-    Object.assign(S, { batches, readings, interventions, telemetry, pills, alerts, season, status, editLog, settingsRows: settings });
-    S.settings = {}; settings.forEach(r => { S.settings[r.key] = r.value; });
+    let d;
+    try { d = await api('bootstrap'); } // one request for everything
+    catch (e) {
+      if (!/Unknown action/.test(e.message)) throw e;
+      const rd = (table, limit) => api('read', { table, limit }).then(r => r.rows); // older server: separate reads, one at a time
+      const rows = {}; for (const t of ['Batches', 'Readings', 'Interventions', 'Telemetry', 'Pills', 'Alerts', 'Settings', 'Lists', 'Season 2025-26']) rows[t] = await rd(t, t === 'Telemetry' ? 20000 : undefined);
+      rows['Edit Log'] = await rd('Edit Log').catch(() => []); rows.status = await api('status'); d = rows; S.oldServer = true;
+    }
+    const g = n => d[n] || [], lists = g('Lists');
+    Object.assign(S, { batches: g('Batches'), readings: g('Readings'), interventions: g('Interventions'), telemetry: g('Telemetry'), pills: g('Pills'), alerts: g('Alerts'), season: g('Season 2025-26'), status: d.status, editLog: g('Edit Log'), settingsRows: g('Settings') });
+    S.settings = {}; S.settingsRows.forEach(r => { S.settings[r.key] = r.value; });
     S.lists = {}; if (lists.length) Object.keys(lists[0]).forEach(k => { S.lists[k] = lists.map(r => r[k]).filter(v => v !== ''); });
+    if (d.status && d.status.version) S.oldServer = d.status.version !== SERVER_VERSION;
     S.loaded = true;
   } catch (e) { S.error = e.message; }
   render();
@@ -144,6 +176,7 @@ function render() {
   let html = '';
   if (S.error) html += `<div class="banner err">${esc(S.error)}</div>`;
   if (!S.loaded && r.view !== 'settings') { app.innerHTML = html + (cfg.url ? '<p class="muted">Loading…</p>' : connectPrompt()); return; }
+  if (S.oldServer) html += '<div class="banner err">The Apps Script is out of date, so loading is slow and some features will fail. Replace Code.gs and deploy a new version (Deploy, Manage deployments, pencil, New version).</div>';
   html += alertBar();
   html += raptBanner();
   app.innerHTML = html + ({ today: viewToday, batch: viewBatch, all: viewAll, trends: viewTrends, import: viewImport, settings: viewSettings }[r.view] || viewToday)(r.arg);
@@ -223,7 +256,7 @@ function card(b) {
   const i = batchInfo(b), prot = i.h !== null && i.h <= setting('ph_protect_hours', 72), phLow = i.ph && prot && Number(i.ph.ph) < setting('ph_min', 4);
   const day7 = i.h !== null && i.h > setting('target_days_to_finish', 7) * 24;
   return `<div class="card"><h3><a href="#/batch/${encodeURIComponent(b.batch_id)}">${esc(b.batch_id)}</a> <span class="muted">${esc(b.vessel)}</span></h3>
-  <div class="muted">${esc(b.spirit)} · ${esc(b.variety)} · ${esc(b.yeast)}${b.pair_id ? ' · pair ' + esc(b.pair_id) : ''}</div>
+  <div style="margin:.3rem 0">${tag('spirit', b.spirit)}${tag('farm', b.farm)}${tag('variety', b.variety)}${tag('yeast', b.yeast)}${b.pair_id ? ` <span class="muted">pair ${esc(b.pair_id)}</span>` : ''}</div>
   <div class="kv"><span>Since pitch</span><b>${i.h === null ? 'not pitched' : fmtDur(i.h)}${day7 ? ' <span class="chip bad">past 7 days</span>' : ''}</b>
   <span>SG</span><b>${f(i.sg, 3)} <span class="muted">${i.sg ? esc(fmtT(i.sgT)) + ' · ' + i.sgSrc : ''}</span></b>
   <span>pH</span><b class="${phLow ? 'bad-t' : ''}">${i.ph ? f(i.ph.ph, 2) : '–'} <span class="muted">${i.ph ? esc(fmtT(i.ph.timestamp)) : ''}</span></b>
@@ -290,27 +323,32 @@ function batchKpis(M) {
   ${M.tempMax !== null ? kpiCard('Peak temperature', f(M.tempMax, 1) + ' °C', 'from readings and Pills', M.tempMax > setting('temp_max_c', 34) ? 'bad-t' : '') : ''}</div>`;
 }
 function batchCharts(M) {
-  if (!M.hasPitch) return '<div class="card muted">Set a pitch time to see the curves. Charts start at pitch.</div>';
+  const bt = (label, fn) => `<button class="small" onclick="${fn}">${label}</button>`, old = M.kind === 'old', q = esc(M.id);
+  const sgBtn = old ? bt('Edit SG readings', `openSeasonReadings('${q}','sg')`) : bt('+ SG reading', `openReadingForm('${q}','sg')`);
+  const phBtn = old ? bt('Edit pH readings', `openSeasonReadings('${q}','ph')`) : bt('+ pH reading', `openReadingForm('${q}','ph')`);
+  const tpBtn = old ? '' : bt('+ Temp reading', `openReadingForm('${q}','temperature_c')`);
+  if (!M.hasPitch) return `<div class="card muted">Set a pitch time to see the curves. Charts start at pitch.</div><h3>Gravity ${sgBtn}</h3><h3>pH ${phBtn}</h3>${old ? '' : `<h3>Temperature ${tpBtn}</h3>`}`;
   const x1 = Math.max(192, Math.ceil(((M.lastX || 0) + 6) / 24) * 24), xs = x1 > 240 ? 48 : 24, xt = [], xf = v => (v / 24) + 'd'; for (let v = 0; v <= x1; v += xs) xt.push(v);
   const days7 = setting('target_days_to_finish', 7) * 24, vl = M.iv.map(v => ({ x: v.x, color: IV_COL[v.type] || '#888', label: String(v.type).slice(0, 3), dash: '2 3' }));
   if (M.finH !== null && M.finH !== undefined) vl.push({ x: M.finH, color: '#111827', label: M.kind === 'old' ? 'called done' : 'finish', dash: '6 3', row: 1 });
   const base = [{ x: days7, color: '#dc2626', label: '7 days' }, ...vl];
   const sgAll = (M.sgRaw || []).concat(M.sgManual).map(p => p[1]);
-  const sgLo = Math.min(0.99, ...sgAll) - 0.002, sgHi = Math.max(1.08, ...sgAll) + 0.005, old = M.kind === 'old';
-  let h = `<h3>Gravity</h3>${chart({ label: 'SG against time since pitch', x0: 0, x1, y0: sgLo, y1: sgHi, yd: 3, xt, xf, xl: 'days since pitch', vlines: base, series: [{ pts: M.sgRaw || [], line: true, color: '#93c5fd', w: 1, op: .8 }, { pts: M.sgSmooth || [], line: true, color: '#2563eb', w: 2 }, { pts: M.sgManual, line: old, dots: true, color: old ? '#2563eb' : '#111827', w: 1.5, tip: p => 'SG ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
+  const sgLo = Math.min(0.99, ...sgAll) - 0.002, sgHi = Math.max(1.08, ...sgAll) + 0.005;
+  let h = `<h3>Gravity ${sgBtn}</h3>${chart({ label: 'SG against time since pitch', x0: 0, x1, y0: sgLo, y1: sgHi, yd: 3, xt, xf, xl: 'days since pitch', vlines: base, series: [{ pts: M.sgRaw || [], line: true, color: '#93c5fd', w: 1, op: .8 }, { pts: M.sgSmooth || [], line: true, color: '#2563eb', w: 2 }, { pts: M.sgManual, line: old, dots: true, color: old ? '#2563eb' : '#111827', w: 1.5, tip: p => 'SG ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
   <div class="legend muted"><span><i style="background:#93c5fd"></i>Pill raw</span><span><i style="background:#2563eb"></i>Pill smoothed (5 pts)</span><span><i style="background:#111827"></i>Manual</span>${M.T.length || old ? '' : '<span>No Pill data yet</span>'}</div>`;
   const pv = M.ph.map(p => p[1]).concat((M.adj || []).map(p => p[1])), pLo = Math.min(3, ...pv) - 0.1, pHi = Math.max(5.6, ...pv) + 0.1;
-  h += `<h3>pH</h3>${chart({ label: 'pH against time since pitch', x0: 0, x1, y0: pLo, y1: pHi, yd: 1, xt, xf, xl: 'days since pitch', bands: [{ y0: setting('ph_min', 4), y1: setting('ph_ceiling', 5), color: '#16a34a' }], vlines: [...base, { x: setting('ph_protect_hours', 72), color: '#888', label: 'buffer window ends', row: 2 }], series: [{ pts: M.ph, line: true, dots: true, color: '#16a34a', tip: p => 'pH ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }, { pts: M.adj || [], dots: true, color: '#111827', r: 4, tip: p => 'adjusted start pH ' + p[1] }] })}
+  h += `<h3>pH ${phBtn}</h3>${chart({ label: 'pH against time since pitch', x0: 0, x1, y0: pLo, y1: pHi, yd: 1, xt, xf, xl: 'days since pitch', bands: [{ y0: setting('ph_min', 4), y1: setting('ph_ceiling', 5), color: '#16a34a' }], vlines: [...base, { x: setting('ph_protect_hours', 72), color: '#888', label: 'buffer window ends', row: 2 }], series: [{ pts: M.ph, line: true, dots: true, color: '#16a34a', tip: p => 'pH ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }, { pts: M.adj || [], dots: true, color: '#111827', r: 4, tip: p => 'adjusted start pH ' + p[1] }] })}
   <div class="legend muted"><span><i style="background:#16a34a;opacity:.4"></i>pH ${setting('ph_min', 4)}–${setting('ph_ceiling', 5)} band</span>${old && M.adj.length ? '<span><i style="background:#111827"></i>adjusted starting pH</span>' : ''}${Object.keys(IV_COL).map(k => `<span><i style="background:${IV_COL[k]}"></i>${k}</span>`).join('')}</div>`;
+  if (!old && !((M.tempManual && M.tempManual.length) || (M.tempRaw && M.tempRaw.length))) h += `<h3>Temperature ${tpBtn}</h3><p class="muted">No temperature readings yet.</p>`;
   if (!old && ((M.tempManual && M.tempManual.length) || (M.tempRaw && M.tempRaw.length))) {
     const tv = M.tempManual.concat(M.tempRaw).map(p => p[1]), tMax = setting('temp_max_c', 34), tLo = Math.min(...tv, 20) - 1, tHi = Math.max(...tv, tMax) + 2;
-    h += `<h3>Temperature</h3>${chart({ label: 'Temperature against time since pitch', x0: 0, x1, y0: tLo, y1: tHi, yd: 0, xt, xf, xl: 'days since pitch', bands: [{ y0: tMax, y1: tHi, color: '#dc2626' }], vlines: base, series: [{ pts: M.tempRaw, line: true, color: '#fca5a5', w: 1, op: .8 }, { pts: M.tempSmooth, line: true, color: '#dc2626', w: 2 }, { pts: M.tempManual, dots: true, color: '#111827', tip: p => p[1] + ' °C at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
+    h += `<h3>Temperature ${tpBtn}</h3>${chart({ label: 'Temperature against time since pitch', x0: 0, x1, y0: tLo, y1: tHi, yd: 0, xt, xf, xl: 'days since pitch', bands: [{ y0: tMax, y1: tHi, color: '#dc2626' }], vlines: base, series: [{ pts: M.tempRaw, line: true, color: '#fca5a5', w: 1, op: .8 }, { pts: M.tempSmooth, line: true, color: '#dc2626', w: 2 }, { pts: M.tempManual, dots: true, color: '#111827', tip: p => p[1] + ' °C at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
     <div class="legend muted"><span><i style="background:#fca5a5"></i>Pill raw</span><span><i style="background:#dc2626"></i>Pill smoothed</span><span><i style="background:#111827"></i>Manual</span><span><i style="background:#dc2626;opacity:.3"></i>above ${tMax} °C</span></div>`;
   }
   if (old) h += `<p class="muted">Last season's readings are plotted as recorded: the 6 h to 48 h columns at those hours, then Day 3 at 72 h and so on at 24 h a day. Ending values sit at the day the batch was called done. Only batches 3.30 to 3.33 have readings during the ferment.${isNum(M.r.ph_day7_second_col) ? ' A second "pH Day 7" value (' + M.r.ph_day7_second_col + ') is not plotted because its time is unknown.' : ''}</p>`;
   return h;
 }
-function detailGrid(pairs) { return `<div class="card" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:.7rem 1rem">${pairs.map(([k, v]) => `<div><div class="muted" style="font:400 .68rem var(--mono)">${esc(k)}</div><div style="font:500 .88rem var(--mono);word-break:break-word">${v === '' || v == null ? '–' : esc(v)}</div></div>`).join('')}</div>`; }
+function detailGrid(pairs) { return `<div class="card" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:.7rem 1rem">${pairs.map(([k, v]) => `<div><div class="muted" style="font:400 .68rem var(--mono)">${esc(k)}</div><div style="font:500 .88rem var(--mono);word-break:break-word">${v === '' || v == null ? '–' : (TAG_KINDS.indexOf(k) >= 0 ? tag(k, v) : esc(v))}</div></div>`).join('')}</div>`; }
 function editHistory(tab, id) {
   const L = S.editLog.filter(e => e.tab === tab && String(e.record_id) === String(id)).sort((a, c) => String(c.timestamp).localeCompare(String(a.timestamp)));
   return `<h3>Edit history</h3>${L.length ? table(['When', 'Who', 'Field', 'Was', 'Now'], L.map(e => [fmtT(e.timestamp), e.edited_by, e.field, e.old_value, e.new_value])) : '<p class="muted">No edits since it was entered.</p>'}`;
@@ -321,16 +359,17 @@ function viewBatch(arg) {
   if (!M) return `<p>Batch ${esc(id)} not found. <a href="#/all">All batches</a></p>`;
   const src = M.kind === 'old' ? M.r : M.b, back = '<p><a href="#/all">← All batches</a> · <a href="#/today">Today</a></p>';
   let h = back + `<div class="row"><h2 style="flex:3;margin:0">${esc(M.id)} <span class="muted">${esc(src.vessel)} · ${esc(M.kind === 'old' ? (M.finished ? 'called done' : 'incomplete') : src.status)} · ${esc(M.season)}</span></h2>
-  <button class="primary" onclick="${M.kind === 'old' ? `openSeasonForm('${esc(M.id)}')` : `openBatchForm('${esc(M.id)}')`}">Edit batch</button>${M.kind === 'cur' ? `<button onclick="openReadingForm('${esc(M.id)}')">+ Reading</button><button onclick="openIvForm('${esc(M.id)}')">+ Intervention</button>` : ''}</div>
-  <div class="muted">${esc(src.spirit)} · ${esc(src.farm)} · ${esc(src.variety)} · ${esc(src.yeast)}${M.kind === 'cur' ? ' · pitched ' + esc(fmtT(src.pitch_time)) : ' · fermentation date ' + esc(src.ferment_date || '–')}</div>`;
+  <button class="primary" onclick="${M.kind === 'old' ? `openSeasonForm('${esc(M.id)}')` : `openBatchForm('${esc(M.id)}')`}">Edit batch</button>${M.kind === 'cur' ? `<button onclick="openReadingForm('${esc(M.id)}')">+ Reading</button>` : ''}</div>
+  <div style="margin:.4rem 0">${tag('spirit', src.spirit)}${tag('farm', src.farm)}${tag('variety', src.variety)}${tag('yeast', src.yeast)} <span class="muted">${M.kind === 'cur' ? 'pitched ' + esc(fmtT(src.pitch_time)) : 'fermentation date ' + esc(src.ferment_date || '–')}</span></div>`;
   h += batchKpis(M) + batchCharts(M);
   if (M.kind === 'cur') {
     const b = M.b, sib = S.batches.filter(x => b.pair_id && x.pair_id === b.pair_id && String(x.batch_id) !== M.id), kids = S.batches.filter(x => x.source_batch_id && String(x.source_batch_id) === M.id), srcB = b.source_batch_id ? S.batches.find(x => String(x.batch_id) === String(b.source_batch_id)) : null;
     if (sib.length || kids.length || b.source_batch_id) h += `<h3>Pair and lineage</h3><div class="card">${sib.length ? 'Pair ' + esc(b.pair_id) + ': ' + sib.map(x => `<a href="${bLink(x.batch_id)}">${esc(x.batch_id)}</a>`).join(', ') + '<br>' : ''}${b.source_batch_id ? 'Pitched from a crop of ' + (srcB ? `<a href="${bLink(srcB.batch_id)}">${esc(srcB.batch_id)}</a>` : esc(b.source_batch_id)) + (isNum(b.repitch_generation) ? ' (generation ' + esc(b.repitch_generation) + ')' : '') + '<br>' : ''}${kids.length ? 'Crop used to pitch: ' + kids.map(x => `<a href="${bLink(x.batch_id)}">${esc(x.batch_id)}</a>`).join(', ') : ''}</div>`;
-    h += `<h3>Details</h3>${detailGrid(Object.keys(b).filter(k => k !== 'notes').map(k => [k, /_time$/.test(k) ? (b[k] ? fmtT(b[k]) : '') : b[k]]))}`;
+    h += `<h3>Result <button class="small" onclick="openFinishForm('${esc(M.id)}')">${M.finished || isNum(b.ending_sg) ? 'Edit finish details' : 'Record finish'}</button></h3>${detailGrid([['status', b.status], ['finish_time', b.finish_time ? fmtT(b.finish_time) : ''], ['ending_sg', b.ending_sg], ['ending_ph', b.ending_ph], ['confirmed_dry', b.confirmed_dry === true ? 'Yes' : 'No']])}`;
+    h += `<h3>Details</h3>${detailGrid(Object.keys(b).filter(k => ['notes', 'status', 'finish_time', 'ending_sg', 'ending_ph', 'confirmed_dry'].indexOf(k) < 0).map(k => [k, /_time$/.test(k) ? (b[k] ? fmtT(b[k]) : '') : b[k]]))}`;
     if (b.notes) h += `<h3>Notes</h3><div class="card">${esc(b.notes)}</div>`;
-    h += `<h3>Readings <button class="small" onclick="csvReadings('${esc(M.id)}')">CSV</button></h3>${table(['Time', 'Hours', 'pH', 'SG', 'Temp °C', 'By', 'Notes'], M.R.slice().reverse().map(r => [fmtT(r.timestamp), M.hasPitch ? f((new Date(r.timestamp) - new Date(b.pitch_time)) / 36e5, 1) : '–', f(r.ph, 2), f(r.sg, 3), f(r.temperature_c, 1), r.entered_by, r.notes]))}
-    <h3>Interventions</h3>${table(['Time', 'Hours', 'Type', 'Product', 'Amount', 'By', 'Notes'], M.I.slice().reverse().map(r => [fmtT(r.timestamp), M.hasPitch ? f((new Date(r.timestamp) - new Date(b.pitch_time)) / 36e5, 1) : '–', r.type, r.product, (r.amount === '' ? '' : r.amount + ' ' + r.unit), r.entered_by, r.notes]))}`;
+    h += `<h3>Readings <button class="small" onclick="openReadingForm('${esc(M.id)}')">+ Reading</button> <button class="small" onclick="csvReadings('${esc(M.id)}')">CSV</button></h3>${table(['Time', 'Hours', 'pH', 'SG', 'Temp °C', 'By', 'Notes'], M.R.slice().reverse().map(r => [fmtT(r.timestamp), M.hasPitch ? f((new Date(r.timestamp) - new Date(b.pitch_time)) / 36e5, 1) : '–', f(r.ph, 2), f(r.sg, 3), f(r.temperature_c, 1), r.entered_by, r.notes]))}
+    <h3>Interventions <button class="small" onclick="openIvForm('${esc(M.id)}')">+ Intervention</button></h3>${table(['Time', 'Hours', 'Type', 'Product', 'Amount', 'By', 'Notes'], M.I.slice().reverse().map(r => [fmtT(r.timestamp), M.hasPitch ? f((new Date(r.timestamp) - new Date(b.pitch_time)) / 36e5, 1) : '–', r.type, r.product, (r.amount === '' ? '' : r.amount + ' ' + r.unit), r.entered_by, r.notes]))}`;
     h += editHistory('Batches', M.id);
   } else {
     const r = M.r, skip = ['source_row', 'notes', 'dq_flags'].concat(SG_COLS.map(x => x[0]), PH_COLS.map(x => x[0]), ['ph_day7_second_col']);
@@ -365,7 +404,7 @@ function viewAll() {
   let h = `<div class="row" style="margin-bottom:.6rem"><h2 style="margin:0;flex:2">All batches <span class="muted">(${rows.length})</span></h2><button onclick="csvAll()">Export CSV</button></div>
   <div class="row"><div><label>Search</label><input id="fq" value="${esc(S.flt.q)}"></div><div><label>Season</label><select id="fs"><option value="">All</option>${opts('season')}</select></div><div><label>Status</label><select id="fst"><option value="">All</option>${opts('status')}</select></div><div><label>&nbsp;</label><label style="display:flex;gap:.4rem;align-items:center;margin:0;padding:.45rem 0"><input type="checkbox" id="fg" style="width:auto" ${S.flt.group ? 'checked' : ''}> Group by pair</label></div></div><div style="height:.6rem"></div>`;
   const head = ALLCOLS.map(([k, l]) => `<th data-k="${k}">${esc(l)}${S.sort.key === k ? (S.sort.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('');
-  const cell = (r, k) => k === 'pitch' ? fmtT(r.pitch) : k === 'days' ? (r.days != null ? f(r.days, 1) : (r.elapsed != null ? f(r.elapsed, 1) + ' (running)' : '–')) : k === 'og' || k === 'end_sg' ? f(r[k], 3) : k === 'batch_id' ? `<a href="${bLink(r.batch_id, r.src === 'old' ? '2025-26' : '')}">${esc(r.batch_id)}</a>` : esc(r[k]);
+  const cell = (r, k) => k === 'pitch' ? fmtT(r.pitch) : k === 'days' ? (r.days != null ? f(r.days, 1) : (r.elapsed != null ? f(r.elapsed, 1) + ' (running)' : '–')) : k === 'og' || k === 'end_sg' ? f(r[k], 3) : TAG_KINDS.indexOf(k) >= 0 ? tag(k, r[k]) : k === 'batch_id' ? `<a href="${bLink(r.batch_id, r.src === 'old' ? '2025-26' : '')}">${esc(r.batch_id)}</a>` : esc(r[k]);
   let body = ''; let last = null;
   rows.forEach(r => { if (S.flt.group && r.pair_id !== last) { body += `<tr class="grp"><td colspan="${ALLCOLS.length}">${r.pair_id ? 'Pair ' + esc(r.pair_id) : 'No pair'}</td></tr>`; last = r.pair_id; } body += `<tr>${ALLCOLS.map(([k]) => `<td>${cell(r, k)}</td>`).join('')}</tr>`; });
   return h + `<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
@@ -406,7 +445,7 @@ function viewTrends() {
   h += scatter('Days to finish against starting gravity', 'ogn', 'starting gravity (SG)', null, v => v.toFixed(3));
   h += scatter('Days to finish against cane age', 'age', 'days from cut to pitch (2026-27) or delivery to pitch (2025-26, cut time not recorded)', null, v => v.toFixed(1));
   const group = key => { const g = {}; rows.forEach(r => { const k = r[key] || '(blank)'; (g[k] = g[k] || []).push(r.days); }); const mx = Math.max(1, ...Object.values(g).map(a => median(a))); return table2(key, g, mx); };
-  const table2 = (key, g, mx) => `<div class="tablewrap"><table><thead><tr><th>${esc(key)}</th><th>Batches</th><th>Median days</th><th></th><th>Mean</th><th>Range</th></tr></thead><tbody>${Object.keys(g).sort().map(k => { const a = g[k]; return `<tr><td>${esc(k)}</td><td>${a.length}</td><td>${f(median(a), 1)}</td><td style="width:30%"><div class="bar" style="width:${(median(a) / mx * 100).toFixed(0)}%"></div></td><td>${f(mean(a), 1)}</td><td>${f(Math.min(...a), 0)}–${f(Math.max(...a), 0)}</td></tr>`; }).join('')}</tbody></table></div>`;
+  const table2 = (key, g, mx) => `<div class="tablewrap"><table><thead><tr><th>${esc(key)}</th><th>Batches</th><th>Median days</th><th></th><th>Mean</th><th>Range</th></tr></thead><tbody>${Object.keys(g).sort().map(k => { const a = g[k]; return `<tr><td>${k !== '(blank)' && TAG_KINDS.indexOf(key) >= 0 ? tag(key, k) : esc(k)}</td><td>${a.length}</td><td>${f(median(a), 1)}</td><td style="width:30%"><div class="bar" style="width:${(median(a) / mx * 100).toFixed(0)}%"></div></td><td>${f(mean(a), 1)}</td><td>${f(Math.min(...a), 0)}–${f(Math.max(...a), 0)}</td></tr>`; }).join('')}</tbody></table></div>`;
   ['variety', 'farm', 'yeast'].forEach(k => { h += `<h3>By ${k}</h3>${group(k)}`; });
   setTimeout(() => { const a = $('#ts'), b = $('#ty'); if (a) { a.value = S.tr.season; a.onchange = e => { S.tr.season = e.target.value; render(); }; } if (b) { b.value = S.tr.yeast; b.onchange = e => { S.tr.yeast = e.target.value; render(); }; } }, 0);
   return h;
@@ -432,7 +471,7 @@ function viewSettings() {
   <label>Web app URL (ends in /exec)</label><input id="cu" value="${esc(cfg.url || '')}" autocomplete="off">
   <label>Token</label><input id="ct" type="password" value="${esc(cfg.token || '')}" autocomplete="off">
   <label>Your name (saved with entries)</label><input id="cn" value="${esc(cfg.name || '')}">
-  <div class="row" style="margin-top:.7rem"><button class="primary" id="cs">Save and connect</button><button id="cc">Forget on this device</button></div><div id="cm" class="muted" style="margin-top:.5rem"></div></div>
+  <div class="row" style="margin-top:.7rem"><button class="primary" id="cs">Save and connect</button><button id="cc">Forget on this device</button></div><div id="cm" class="muted" style="margin-top:.5rem"></div><div class="muted">Server version: ${esc((S.status && S.status.version) || 'not updated (no version reported)')} · page expects ${SERVER_VERSION}</div></div>
   <div class="card" style="margin-top:.8rem"><h3>Alerts</h3><p class="muted">Alerts appear as a bar at the top of every page. Nothing is sent by email or message.</p><button onclick="S.testAlert=true;location.hash='#/today';render()">Show a test alert</button></div>
   ${S.loaded ? `<h3>Thresholds and targets</h3><p class="muted">Changes apply to everyone and are recorded in the note column with your name and the time.</p>${S.settingsRows.map(r => `<div class="card" style="margin-bottom:.5rem"><b>${esc(r.key)}</b><div class="muted">${esc(r.note)}</div><div class="row" style="margin-top:.3rem"><input data-sk="${esc(r.key)}" value="${esc(r.value)}"><button class="small" data-sb="${esc(r.key)}">Save</button></div></div>`).join('')}` : ''}`;
 }
@@ -447,17 +486,20 @@ function bindSettings() {
 const who = () => { if (!cfg.name) { const n = prompt('Your name (saved with each entry):'); if (n) { cfg.name = n.trim(); saveCfg(); } } if (!cfg.name) throw new Error('A name is needed to save entries.'); return cfg.name; };
 const nowLocal = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
 const toIso = v => v ? new Date(v).toISOString() : '';
-const opt = (arr, sel) => `<option value=""></option>` + (arr || []).map(v => `<option ${v === sel ? 'selected' : ''}>${esc(v)}</option>`).join('') + (sel && (arr || []).indexOf(sel) < 0 ? `<option selected>${esc(sel)}</option>` : '');
+const opt = (arr, sel, kind) => `<option value=""></option>` + (arr || []).map(v => `<option ${v === sel ? 'selected' : ''} style="${kind ? tagCss(kind, v) : ''}">${esc(v)}</option>`).join('') + (sel && (arr || []).indexOf(sel) < 0 ? `<option selected>${esc(sel)}</option>` : '');
 function dlg(html, onsave) {
   const d = $('#dlg'); d.innerHTML = `<form method="dialog" id="df">${html}<div id="de" class="bad-t" style="margin-top:.5rem"></div><div class="row" style="margin-top:.8rem"><button type="button" id="dx">Cancel</button><button class="primary" id="ds" type="submit">Save</button></div></form>`;
   d.showModal(); $('#dx').onclick = () => d.close();
+  d.querySelectorAll('select[data-kind]').forEach(el => el.addEventListener('change', () => { el.style.cssText = tagCss(el.dataset.kind, el.value); }));
   $('#df').onsubmit = async e => { e.preventDefault(); const btn = $('#ds'); btn.disabled = true; try { await onsave(); d.close(); await load(); } catch (err) { $('#de').textContent = err.message; btn.disabled = false; } };
 }
 const val = id => $('#' + id).value;
-function openReadingForm(bid) {
-  dlg(`<h3>Reading for ${esc(bid)}</h3><label>Time</label><input id="f_t" type="datetime-local" value="${nowLocal()}" required>
-  <div class="row"><div><label>pH</label><input id="f_ph" type="number" step="0.01" inputmode="decimal"></div><div><label>SG</label><input id="f_sg" type="number" step="0.001" inputmode="decimal"></div><div><label>Temp °C</label><input id="f_tp" type="number" step="0.1" inputmode="decimal"></div></div><label>Notes</label><input id="f_n">`,
-    () => api('addReading', { row: { batch_id: bid, timestamp: toIso(val('f_t')), ph: val('f_ph'), sg: val('f_sg'), temperature_c: val('f_tp'), notes: val('f_n'), entered_by: who() } }));
+function openReadingForm(bid, focus) { // focus: 'ph' | 'sg' | 'temperature_c' shows just that value
+  const F = { ph: ['pH', '0.01'], sg: ['SG', '0.001'], temperature_c: ['Temp °C', '0.1'] }, keys = focus && F[focus] ? [focus] : ['ph', 'sg', 'temperature_c'];
+  dlg(`<h3>${focus && F[focus] ? F[focus][0] + ' reading' : 'Reading'} for ${esc(bid)}</h3><label>Time</label><input id="f_t" type="datetime-local" value="${nowLocal()}" required>
+  <div class="row">${keys.map(k => `<div><label>${F[k][0]}</label><input id="f_${k}" type="number" step="${F[k][1]}" inputmode="decimal" ${keys.length === 1 ? 'required' : ''}></div>`).join('')}</div><label>Notes</label><input id="f_n">`,
+    () => { const g = k => $('#f_' + k) ? val('f_' + k) : ''; return api('addReading', { row: { batch_id: bid, timestamp: toIso(val('f_t')), ph: g('ph'), sg: g('sg'), temperature_c: g('temperature_c'), notes: val('f_n'), entered_by: who() } }); });
+  const el = $('#f_' + keys[0]); if (el) el.focus();
 }
 function openIvForm(bid) {
   dlg(`<h3>Intervention for ${esc(bid)}</h3><label>Time</label><input id="f_t" type="datetime-local" value="${nowLocal()}" required>
@@ -492,12 +534,12 @@ function wireAdd(prefix) { // "＋ Add new…" in a dropdown adds a permanent op
       try {
         const r = await api('addListOption', { list: k, value: v.trim(), enteredBy: who() });
         S.lists[k] = S.lists[k] || []; if (S.lists[k].indexOf(r.value) < 0) S.lists[k].push(r.value);
-        el.innerHTML = opt(S.lists[k], r.value) + '<option value="__new__">＋ Add new…</option>'; el.value = r.value; prev = r.value;
+        el.innerHTML = opt(S.lists[k], r.value, k) + '<option value="__new__">＋ Add new…</option>'; el.value = r.value; prev = r.value; el.style.cssText = tagCss(k, r.value);
       } catch (e) { $('#de').textContent = e.message; el.value = prev; }
     };
   });
 }
-const selA = (p, k, arr, cur) => `<div><label>${k}</label><select id="${p}${k}">${opt(arr, cur)}${ADD_KEYS.indexOf(k) >= 0 ? '<option value="__new__">＋ Add new…</option>' : ''}</select></div>`;
+const selA = (p, k, arr, cur) => `<div><label>${k}</label><select id="${p}${k}" ${TAG_KINDS.indexOf(k) >= 0 ? 'data-kind="' + k + '"' : ''} style="${tagCss(k, cur)}">${opt(arr, cur, k)}${ADD_KEYS.indexOf(k) >= 0 ? '<option value="__new__">＋ Add new…</option>' : ''}</select></div>`;
 const inpA = (p, k, v, type, step) => `<div><label>${k}</label><input id="${p}${k}" type="${type || 'text'}" ${step ? 'step="' + step + '"' : ''} value="${esc(v)}"></div>`;
 
 function openBatchForm(id) {
@@ -511,39 +553,56 @@ function openBatchForm(id) {
   <div class="row">${dtField('cut_time', 'cut_time', b.cut_time, false)}${dtField('delivery_time', 'delivery_time', b.delivery_time, fresh)}</div>
   <div class="row">${dtField('press_time', 'crush (press) time', b.press_time, fresh)}${dtField('pitch_time', 'pitch_time', b.pitch_time, fresh)}</div>
   <div class="row">${inp('juice_volume_l', 'number', 'any')}${inp('juice_sg', 'number', '0.001')}${inp('juice_ph', 'number', '0.01')}${inp('water_added_l', 'number', 'any')}${inp('og_after_dilution', 'number', '0.001')}${inp('yeast_grams', 'number', 'any')}</div>
-  ${id ? `<h3>Finish</h3><div class="row">${dtField('finish_time', 'finish_time', b.finish_time, false)}${inp('ending_sg', 'number', '0.001')}${inp('ending_ph', 'number', '0.01')}<div><label>confirmed dry</label><select id="b_confirmed_dry"><option value="">No</option><option value="TRUE" ${b.confirmed_dry === true ? 'selected' : ''}>Yes</option></select></div></div>` : ''}
   <label>notes</label><input id="b_notes" value="${esc(b.notes)}">`,
     () => {
       const o = {}; ['batch_id', 'season', 'spirit', 'farm', 'variety', 'yeast', 'vessel', 'status', 'pair_id', 'source_batch_id', 'repitch_generation', 'pill_id', 'juice_volume_l', 'juice_sg', 'juice_ph', 'water_added_l', 'og_after_dilution', 'yeast_grams', 'notes'].forEach(k => { const v = val('b_' + k); o[k] = v === '__new__' ? '' : v; });
       ['cut_time', 'delivery_time', 'press_time', 'pitch_time'].forEach(k => { o[k] = dtVal(k); });
-      if (id) { o.finish_time = dtVal('finish_time'); o.ending_sg = val('b_ending_sg'); o.ending_ph = val('b_ending_ph'); o.confirmed_dry = val('b_confirmed_dry') === 'TRUE'; }
       return api('saveBatch', { batch: o, enteredBy: who() });
     });
   wireAdd('b_');
 }
 
-/* edit a batch from last season (Season 2025-26 tab). Every change is logged with who, when, old and new value. */
-const OLD_NUMS = ['delivery_weight_kg', 'price_per_kg', 'approximate_weight', 'liquid_in_l', 'sg_juice', 'ph_juice', 'adjusted_start_ph', 'ending_sg', 'ending_ph'];
+/* finish details for a current batch: opened from the Result section */
+function openFinishForm(id) {
+  const b = S.batches.find(x => String(x.batch_id) === id) || {};
+  dlg(`<h3>Finish details for ${esc(id)}</h3><div class="row">${dtField('finish_time', 'finish_time', b.finish_time, true)}</div>
+  <div class="row">${inpA('b_', 'ending_sg', b.ending_sg, 'number', '0.001')}${inpA('b_', 'ending_ph', b.ending_ph, 'number', '0.01')}</div>
+  <div class="row"><div><label>confirmed dry (final SG reading checked)</label><select id="b_confirmed_dry"><option value="">No</option><option value="TRUE" ${b.confirmed_dry === true ? 'selected' : ''}>Yes</option></select></div>
+  <div><label>mark batch as finished</label><select id="b_markdone"><option value="yes" ${b.status === 'finished' ? '' : 'selected'}>Yes</option><option value="no" ${b.status === 'finished' ? 'selected' : ''}>No, leave status as it is</option></select></div></div>`,
+    () => { const o = { batch_id: id, finish_time: dtVal('finish_time'), ending_sg: val('b_ending_sg'), ending_ph: val('b_ending_ph'), confirmed_dry: val('b_confirmed_dry') === 'TRUE' }; if (val('b_markdone') === 'yes') o.status = 'finished'; return api('saveBatch', { batch: o, enteredBy: who() }); });
+}
+
+/* last season's batches (Season 2025-26 tab): the main details open from the top of the page,
+   SG and pH readings open from their own sections. Every change is logged with who, when, old and new value. */
 const OLD_DATES = ['delivery_date', 'ferment_date', 'finish_date_called'];
-function openSeasonForm(id) {
+function seasonSaver(id, r, keys, P) {
+  return () => {
+    const ch = {};
+    keys.forEach(k => { const el = $('#' + P + k); if (!el) return; const v = el.value === '__new__' ? r[k] : el.value; if (String(v == null ? '' : v) !== String(r[k] == null ? '' : r[k])) ch[k] = v; });
+    if (!Object.keys(ch).length) throw new Error('No changes to save.');
+    return api('saveSeasonRow', { batch_id: id, changes: ch, enteredBy: who() });
+  };
+}
+const readingGrid = (P, r, ks) => `<div class="row" style="gap:.4rem">${ks.map(k => `<div style="flex:1 1 90px"><label>${k.replace(/^(sg|ph)_/, '')}</label><input id="${P}${k}" type="number" step="any" value="${esc(r[k])}"></div>`).join('')}</div>`;
+function openSeasonForm(id) { // main details
   const r = S.season.find(x => String(x.batch_id) === id); if (!r) return;
-  const L = S.lists, P = 'o_', allNums = SG_COLS.map(x => x[0]).concat(PH_COLS.map(x => x[0]), ['ph_day7_second_col']);
-  const num = k => inpA(P, k, r[k], 'number', 'any'), grid = ks => `<div class="row" style="gap:.4rem">${ks.map(k => `<div style="flex:1 1 90px"><label>${k.replace(/^(sg|ph)_/, '$1 ')}</label><input id="${P}${k}" type="number" step="any" value="${esc(r[k])}"></div>`).join('')}</div>`;
-  const dateIn = k => `<div><label>${k}</label><input id="${P}${k}" type="date" value="${esc(r[k])}"></div>`;
-  dlg(`<h3>Edit ${esc(id)} <span class="muted">2025-26</span></h3><p class="muted">Changes are saved with your name and logged under Edit history.</p>
+  const L = S.lists, P = 'o_', num = k => inpA(P, k, r[k], 'number', 'any'), dateIn = k => `<div><label>${k}</label><input id="${P}${k}" type="date" value="${esc(r[k])}"></div>`;
+  const keys = ADD_KEYS.concat(OLD_DATES, ['delivery_weight_kg', 'price_per_kg', 'approximate_weight', 'liquid_in_l', 'notes']);
+  dlg(`<h3>Edit ${esc(id)} <span class="muted">2025-26</span></h3><p class="muted">Saved with your name and logged under Edit history. SG and pH readings are edited from their own sections.</p>
   <div class="row">${selA(P, 'spirit', L.spirit, r.spirit)}${selA(P, 'farm', L.farm, r.farm)}${selA(P, 'variety', L.variety, r.variety)}</div><div class="row">${selA(P, 'yeast', L.yeast, r.yeast)}${selA(P, 'vessel', L.vessel, r.vessel)}</div>
   <div class="row">${OLD_DATES.map(dateIn).join('')}</div>
   <div class="row">${['delivery_weight_kg', 'price_per_kg', 'approximate_weight', 'liquid_in_l'].map(num).join('')}</div>
-  <div class="row">${['sg_juice', 'ph_juice', 'adjusted_start_ph', 'ending_sg', 'ending_ph'].map(num).join('')}</div>
-  <h3>SG readings</h3>${grid(SG_COLS.map(x => x[0]))}<h3>pH readings</h3>${grid(PH_COLS.map(x => x[0]).concat(['ph_day7_second_col']))}
-  <label>notes</label><input id="o_notes" value="${esc(r.notes)}">`,
-    () => {
-      const ch = {}, same = (a, b) => String(a == null ? '' : a) === String(b == null ? '' : b);
-      OLD_DATES.concat(OLD_NUMS, allNums, ['notes']).concat(ADD_KEYS.filter(k => k !== 'spirit' || true)).forEach(k => { const el = $('#' + P + k); if (!el) return; const v = el.value === '__new__' ? r[k] : el.value; if (!same(v, r[k])) ch[k] = v; });
-      if (!Object.keys(ch).length) throw new Error('No changes to save.');
-      return api('saveSeasonRow', { batch_id: id, changes: ch, enteredBy: who() });
-    });
+  <label>notes</label><input id="o_notes" value="${esc(r.notes)}">`, seasonSaver(id, r, keys, P));
   wireAdd(P);
+}
+function openSeasonReadings(id, kind) { // 'sg' or 'ph'
+  const r = S.season.find(x => String(x.batch_id) === id); if (!r) return;
+  const P = 'o_', sg = kind === 'sg';
+  const keys = sg ? ['sg_juice'].concat(SG_COLS.map(x => x[0]), ['ending_sg']) : ['ph_juice', 'adjusted_start_ph'].concat(PH_COLS.map(x => x[0]), ['ph_day7_second_col', 'ending_ph']);
+  const one = k => inpA(P, k, r[k], 'number', 'any');
+  dlg(`<h3>${sg ? 'SG' : 'pH'} readings for ${esc(id)} <span class="muted">2025-26</span></h3><p class="muted">Hours or days since pitch, as recorded. Leave a box empty if there was no reading.</p>
+  <div class="row">${sg ? one('sg_juice') + one('ending_sg') : one('ph_juice') + one('adjusted_start_ph') + one('ending_ph')}</div>
+  ${readingGrid(P, r, sg ? SG_COLS.map(x => x[0]) : PH_COLS.map(x => x[0]).concat(['ph_day7_second_col']))}`, seasonSaver(id, r, keys, P));
 }
 
 /* ============ alerts: worked out in the browser, shown as a bar ============ */
@@ -605,7 +664,7 @@ async function ackAlertIdx(n, mins) {
 }
 
 /* ============ start ============ */
-if (cfg.url && cfg.token) load(); else { if (!location.hash || location.hash === '#/today') location.hash = '#/settings'; render(); }
+if (cfg.url && cfg.token) { render(); load(); } else { if (!location.hash || location.hash === '#/today') location.hash = '#/settings'; render(); }
 setInterval(() => { if (document.visibilityState === 'visible' && S.loaded) load(); }, 120000);
 </script>
 </body>

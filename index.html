@@ -58,8 +58,9 @@ tr.grp td{background:var(--chip);font-weight:500}
 .banner.err{background:var(--bad);color:#fff}
 .chart{width:100%;height:auto;display:block;background:var(--card);border:1px solid var(--line);border-radius:8px}
 .chart text{fill:var(--muted);font:400 10px var(--mono)}.chart .gl{stroke:var(--line)}
-dialog{border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);width:min(94vw,520px);padding:1rem}
+dialog{max-height:90vh;overflow:auto;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--fg);width:min(94vw,520px);padding:1rem}
 dialog::backdrop{background:rgba(17,24,39,.4)}
+.dt{display:flex;gap:.3rem}.dt>*{flex:1 1 0;min-width:0}
 .bar{height:.55rem;background:var(--sg);border-radius:2px;min-width:2px}
 .legend span{display:inline-flex;align-items:center;gap:.35rem;margin-right:.9rem;font:400 .7rem var(--mono);color:var(--muted)}
 .legend i{width:.9rem;height:.25rem;display:inline-block;border-radius:2px}
@@ -123,10 +124,10 @@ async function load() {
   try {
     S.error = null;
     const rd = (table, limit) => api('read', { table, limit }).then(r => r.rows);
-    const [batches, readings, interventions, telemetry, pills, alerts, settings, lists, season, status] = await Promise.all([
-      rd('Batches'), rd('Readings'), rd('Interventions'), rd('Telemetry', 20000), rd('Pills'), rd('Alerts'), rd('Settings'), rd('Lists'), rd('Season 2025-26'), api('status')
+    const [batches, readings, interventions, telemetry, pills, alerts, settings, lists, season, status, editLog] = await Promise.all([
+      rd('Batches'), rd('Readings'), rd('Interventions'), rd('Telemetry', 20000), rd('Pills'), rd('Alerts'), rd('Settings'), rd('Lists'), rd('Season 2025-26'), api('status'), rd('Edit Log').catch(() => [])
     ]);
-    Object.assign(S, { batches, readings, interventions, telemetry, pills, alerts, season, status, settingsRows: settings });
+    Object.assign(S, { batches, readings, interventions, telemetry, pills, alerts, season, status, editLog, settingsRows: settings });
     S.settings = {}; settings.forEach(r => { S.settings[r.key] = r.value; });
     S.lists = {}; if (lists.length) Object.keys(lists[0]).forEach(k => { S.lists[k] = lists.map(r => r[k]).filter(v => v !== ''); });
     S.loaded = true;
@@ -135,7 +136,7 @@ async function load() {
 }
 
 /* ============ routing ============ */
-function route() { const h = (location.hash || '#/today').slice(2).split('/'); return { view: h[0] || 'today', arg: decodeURIComponent(h[1] || '') }; }
+function route() { const h = (location.hash || '#/today').slice(2).split('/'); return { view: h[0] || 'today', arg: h.slice(1).map(decodeURIComponent).join('/') }; }
 function render() {
   const r = route();
   $('#nav').innerHTML = NAV.map(([k, l]) => `<a href="#/${k}" class="${r.view === k || (r.view === 'batch' && k === 'today') ? 'on' : ''}">${l}</a>`).join('');
@@ -232,36 +233,114 @@ function card(b) {
   <div style="margin-top:.5rem" class="row"><button class="small" onclick="openReadingForm('${esc(b.batch_id)}')">+ Reading</button><button class="small" onclick="openIvForm('${esc(b.batch_id)}')">+ Intervention</button><a class="btn small" style="text-align:center;text-decoration:none" href="#/batch/${encodeURIComponent(b.batch_id)}">Details</a></div></div>`;
 }
 
-/* ============ VIEW: batch detail ============ */
-function viewBatch(id) {
-  const b = S.batches.find(x => String(x.batch_id) === id);
-  if (!b) return `<p>Batch ${esc(id)} not found. <a href="#/all">All batches</a></p>`;
-  const R = S.readings.filter(r => r.batch_id === id).sort((a, c) => new Date(a.timestamp) - new Date(c.timestamp));
-  const I = S.interventions.filter(r => r.batch_id === id).sort((a, c) => new Date(a.timestamp) - new Date(c.timestamp));
-  const T = tele(id), info = batchInfo(b);
-  let h = `<p><a href="#/today">← Today</a></p><div class="row"><h2 style="flex:3;margin:0">${esc(b.batch_id)} <span class="muted">${esc(b.vessel)} · ${esc(b.status)}</span></h2><button onclick="openBatchForm('${esc(id)}')">Edit batch</button><button class="primary" onclick="openReadingForm('${esc(id)}')">+ Reading</button><button onclick="openIvForm('${esc(id)}')">+ Intervention</button></div>
-  <div class="muted">${esc(b.spirit)} · ${esc(b.farm)} · ${esc(b.variety)} · ${esc(b.yeast)} · pitched ${esc(fmtT(b.pitch_time))}${info.h !== null ? ' (' + fmtDur(info.h) + ' ago)' : ''}</div>`;
-  if (!b.pitch_time) return h + '<div class="card" style="margin-top:.8rem">Set a pitch time to see the curves. Charts start at pitch.</div>';
-  const t0 = new Date(b.pitch_time), X = ts => (new Date(ts) - t0) / 36e5;
-  const vl = I.map(v => ({ x: X(v.timestamp), color: IV_COL[v.type] || '#888', label: v.type.slice(0, 3), dash: '2 3' }));
-  const lastX = Math.max(X(new Date()), ...R.map(r => X(r.timestamp)), ...T.map(r => X(r.timestamp)), 0);
-  const x1 = Math.max(192, Math.ceil((lastX + 6) / 24) * 24), xs = x1 > 240 ? 48 : 24, xt = [], xf = v => (v / 24) + 'd'; for (let v = 0; v <= x1; v += xs) xt.push(v);
-  const days7 = setting('target_days_to_finish', 7) * 24;
-  // SG
-  const rawT = thin(T.map(t => [X(t.timestamp), t.sgc]), 1200), smT = smooth(rawT, 5);
-  const sgM = R.filter(r => isNum(r.sg)).map(r => [X(r.timestamp), Number(r.sg)]);
-  const sgAll = [...rawT, ...sgM].map(p => p[1]).concat(isNum(b.juice_sg) ? [Number(b.juice_sg)] : []);
-  const sgLo = Math.min(0.99, ...sgAll) - 0.002, sgHi = Math.max(1.08, ...sgAll) + 0.005;
-  h += `<h3>Gravity</h3>${chart({ label: 'SG against hours since pitch', x0: 0, x1, y0: sgLo, y1: sgHi, yd: 3, xt, xf, xl: 'days since pitch', vlines: [{ x: days7, color: '#dc2626', label: '7 days' }, ...vl], series: [{ pts: rawT, line: true, color: '#93c5fd', w: 1, op: .8 }, { pts: smT, line: true, color: '#2563eb', w: 2 }, { pts: sgM, dots: true, color: '#111827', tip: p => 'SG ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
-  <div class="legend muted"><span><i style="background:#93c5fd"></i>Pill raw</span><span><i style="background:#2563eb"></i>Pill smoothed (5 pts)</span><span><i style="background:#111827"></i>Manual</span>${T.length ? '' : '<span>No Pill data yet</span>'}</div>`;
-  // pH
-  const phM = R.filter(r => isNum(r.ph)).map(r => [X(r.timestamp), Number(r.ph)]);
-  const pLo = Math.min(3, ...phM.map(p => p[1])) - 0.1, pHi = Math.max(5.6, ...phM.map(p => p[1])) + 0.1;
-  h += `<h3>pH</h3>${chart({ label: 'pH against hours since pitch', x0: 0, x1, y0: pLo, y1: pHi, yd: 1, xt, xf, xl: 'days since pitch', bands: [{ y0: setting('ph_min', 4), y1: setting('ph_ceiling', 5), color: '#16a34a' }], vlines: [{ x: days7, color: '#dc2626', label: '7 days' }, { x: setting('ph_protect_hours', 72), color: '#888', label: 'buffer window ends', row: 1 }, ...vl], series: [{ pts: phM, line: true, dots: true, color: '#16a34a', tip: p => 'pH ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
-  <div class="legend muted"><span><i style="background:#16a34a;opacity:.4"></i>pH ${setting('ph_min', 4)}–${setting('ph_ceiling', 5)} band</span>${Object.keys(IV_COL).map(k => `<span><i style="background:${IV_COL[k]}"></i>${k}</span>`).join('')}</div>`;
-  h += `<h3>Dose calculator</h3><div class="card muted">Titration entry and KHCO₃ dosing arrive in the next build step.</div>`;
-  h += `<h3>Readings <button class="small" onclick="csvReadings('${esc(id)}')">CSV</button></h3>${table(['Time', 'Hours', 'pH', 'SG', 'Temp °C', 'By', 'Notes'], R.slice().reverse().map(r => [fmtT(r.timestamp), f(X(r.timestamp), 1), f(r.ph, 2), f(r.sg, 3), f(r.temperature_c, 1), r.entered_by, r.notes]))}`;
-  h += `<h3>Interventions</h3>${table(['Time', 'Hours', 'Type', 'Product', 'Amount', 'By', 'Notes'], I.slice().reverse().map(r => [fmtT(r.timestamp), f(X(r.timestamp), 1), r.type, r.product, (r.amount === '' ? '' : r.amount + ' ' + r.unit), r.entered_by, r.notes]))}`;
+/* ============ VIEW: batch detail (full page, current and previous batches) ============ */
+const SG_COLS = [['sg_6h', 6], ['sg_12h', 12], ['sg_18h', 18], ['sg_24h', 24], ['sg_30h', 30], ['sg_36h', 36], ['sg_48h', 48], ['sg_day3', 72], ['sg_day4', 96], ['sg_day5', 120], ['sg_day6', 144], ['sg_day7', 168], ['sg_day8', 192]];
+const PH_COLS = [['ph_6h', 6], ['ph_12h', 12], ['ph_18h', 18], ['ph_24h', 24], ['ph_30h', 30], ['ph_48h', 48], ['ph_day3', 72], ['ph_day4', 96], ['ph_day5', 120], ['ph_day6', 144], ['ph_day7', 168]];
+const byTs = (a, c) => new Date(a.timestamp) - new Date(c.timestamp);
+const bLink = (id, season) => season === '2025-26' ? `#/batch/2025-26/${encodeURIComponent(id)}` : `#/batch/${encodeURIComponent(id)}`;
+
+function modelCur(b) {
+  const id = String(b.batch_id), R = S.readings.filter(r => String(r.batch_id) === id).sort(byTs), I = S.interventions.filter(r => String(r.batch_id) === id).sort(byTs), T = tele(id);
+  const t0 = b.pitch_time ? new Date(b.pitch_time) : null, X = ts => (new Date(ts) - t0) / 36e5;
+  const M = { kind: 'cur', id, b, R, I, T, hasPitch: !!t0, season: b.season || '2026-27', running: b.status === 'active' };
+  const info = batchInfo(b);
+  if (t0) {
+    M.sgManual = R.filter(r => isNum(r.sg)).map(r => [X(r.timestamp), Number(r.sg)]);
+    M.sgRaw = thin(T.map(t => [X(t.timestamp), t.sgc]), 1200); M.sgSmooth = smooth(M.sgRaw, 5);
+    M.ph = R.filter(r => isNum(r.ph)).map(r => [X(r.timestamp), Number(r.ph)]);
+    M.tempManual = R.filter(r => isNum(r.temperature_c)).map(r => [X(r.timestamp), Number(r.temperature_c)]);
+    M.tempRaw = thin(T.filter(t => isNum(t.temperature_c)).map(t => [X(t.timestamp), Number(t.temperature_c)]), 1200); M.tempSmooth = smooth(M.tempRaw, 5);
+    M.iv = I.map(v => ({ x: X(v.timestamp), type: v.type }));
+    M.finH = b.finish_time ? X(b.finish_time) : null; M.nowH = X(new Date());
+    M.lastX = Math.max(0, M.nowH * (M.running ? 1 : 0), M.finH || 0, ...M.sgManual.map(p => p[0]), ...M.ph.map(p => p[0]), ...M.sgRaw.map(p => p[0]));
+  }
+  M.og = [b.og_after_dilution, b.juice_sg].find(isNum); if (!isNum(M.og)) { const f1 = R.find(r => isNum(r.sg)); M.og = f1 ? f1.sg : null; }
+  M.fg = isNum(b.ending_sg) ? Number(b.ending_sg) : (info.sg ? Number(info.sg) : null);
+  const phv = M.ph ? M.ph.map(p => p[1]) : []; M.phStart = isNum(b.juice_ph) ? Number(b.juice_ph) : (phv.length ? phv[0] : null);
+  M.phMin = phv.length ? Math.min(...phv) : null; M.phLast = isNum(b.ending_ph) ? Number(b.ending_ph) : (phv.length ? phv[phv.length - 1] : null);
+  const tv = (M.tempManual || []).concat(M.tempRaw || []).map(p => p[1]); M.tempMax = tv.length ? Math.max(...tv) : null;
+  M.days = M.finH !== null && M.finH !== undefined ? M.finH / 24 : (t0 ? M.nowH / 24 : null); M.finished = M.finH !== null && M.finH !== undefined;
+  return M;
+}
+function modelOld(id) {
+  const r = S.season.find(x => String(x.batch_id) === id); if (!r) return null;
+  const fin = isNum(r.days_to_called_finish) ? Number(r.days_to_called_finish) * 24 : null;
+  const sg = [], ph = [];
+  if (isNum(r.sg_juice)) sg.push([0, Number(r.sg_juice)]);
+  SG_COLS.forEach(([k, h]) => { if (isNum(r[k])) sg.push([h, Number(r[k])]); });
+  if (isNum(r.ending_sg) && fin !== null) sg.push([fin, Number(r.ending_sg)]);
+  if (isNum(r.ph_juice)) ph.push([0, Number(r.ph_juice)]);
+  PH_COLS.forEach(([k, h]) => { if (isNum(r[k])) ph.push([h, Number(r[k])]); });
+  if (isNum(r.ending_ph) && fin !== null) ph.push([fin, Number(r.ending_ph)]);
+  const adj = isNum(r.adjusted_start_ph) ? [[0, Number(r.adjusted_start_ph)]] : [];
+  const phv = ph.map(p => p[1]).concat(adj.map(p => p[1]));
+  return { kind: 'old', id, r, season: '2025-26', sgManual: sg, ph, adj, hasPitch: !!r.ferment_date, finH: fin, finished: fin !== null, running: false, iv: [], I: [], R: [], T: [],
+    og: isNum(r.sg_juice) ? Number(r.sg_juice) : null, fg: isNum(r.ending_sg) ? Number(r.ending_sg) : (sg.length > 1 ? sg[sg.length - 1][1] : null),
+    phStart: isNum(r.ph_juice) ? Number(r.ph_juice) : null, phMin: phv.length ? Math.min(...phv) : null, phLast: isNum(r.ending_ph) ? Number(r.ending_ph) : null, tempMax: null,
+    days: fin !== null ? fin / 24 : null, lastX: Math.max(0, fin || 0, ...sg.map(p => p[0]), ...ph.map(p => p[0])) };
+}
+function kpiCard(label, value, sub, cls) { return `<div class="card"><div class="muted" style="font:400 .7rem var(--mono);letter-spacing:.04em">${esc(label)}</div><div style="font:500 1.45rem/1.3 var(--mono)" class="${cls || ''}">${value}</div><div class="muted">${sub || ''}</div></div>`; }
+function batchKpis(M) {
+  const target = setting('target_days_to_finish', 7), att = isNum(M.og) && isNum(M.fg) && M.og > 1 ? (M.og - M.fg) / (M.og - 1) * 100 : null, abv = isNum(M.og) && isNum(M.fg) ? (M.og - M.fg) * 131.25 : null;
+  return `<div class="grid" style="margin:.8rem 0">${kpiCard(M.finished || M.kind === 'old' ? 'Days to finish' : 'Days running', M.days !== null ? M.days.toFixed(1) : '–', M.finished ? (M.kind === 'old' ? 'called done, target ' + target : 'target ' + target) : (M.kind === 'old' ? 'no finish date recorded' : (M.running ? 'target ' + target : '')), M.days !== null && M.days > target ? 'warn-t' : '')}
+  ${kpiCard('Starting SG', f(M.og, 3), M.kind === 'cur' && isNum(M.b.og_after_dilution) ? 'after dilution' : 'juice')}
+  ${kpiCard(M.finished ? 'Ending SG' : 'Latest SG', f(M.fg, 3), att !== null ? 'apparent attenuation ' + att.toFixed(0) + '%' : '')}
+  ${kpiCard('Estimated ABV', abv !== null ? abv.toFixed(1) + '%' : '–', 'from SG change, rough estimate')}
+  ${kpiCard('pH start → low → last', `${f(M.phStart, 2)} → ${f(M.phMin, 2)} → ${f(M.phLast, 2)}`, '')}
+  ${M.tempMax !== null ? kpiCard('Peak temperature', f(M.tempMax, 1) + ' °C', 'from readings and Pills', M.tempMax > setting('temp_max_c', 34) ? 'bad-t' : '') : ''}</div>`;
+}
+function batchCharts(M) {
+  if (!M.hasPitch) return '<div class="card muted">Set a pitch time to see the curves. Charts start at pitch.</div>';
+  const x1 = Math.max(192, Math.ceil(((M.lastX || 0) + 6) / 24) * 24), xs = x1 > 240 ? 48 : 24, xt = [], xf = v => (v / 24) + 'd'; for (let v = 0; v <= x1; v += xs) xt.push(v);
+  const days7 = setting('target_days_to_finish', 7) * 24, vl = M.iv.map(v => ({ x: v.x, color: IV_COL[v.type] || '#888', label: String(v.type).slice(0, 3), dash: '2 3' }));
+  if (M.finH !== null && M.finH !== undefined) vl.push({ x: M.finH, color: '#111827', label: M.kind === 'old' ? 'called done' : 'finish', dash: '6 3', row: 1 });
+  const base = [{ x: days7, color: '#dc2626', label: '7 days' }, ...vl];
+  const sgAll = (M.sgRaw || []).concat(M.sgManual).map(p => p[1]);
+  const sgLo = Math.min(0.99, ...sgAll) - 0.002, sgHi = Math.max(1.08, ...sgAll) + 0.005, old = M.kind === 'old';
+  let h = `<h3>Gravity</h3>${chart({ label: 'SG against time since pitch', x0: 0, x1, y0: sgLo, y1: sgHi, yd: 3, xt, xf, xl: 'days since pitch', vlines: base, series: [{ pts: M.sgRaw || [], line: true, color: '#93c5fd', w: 1, op: .8 }, { pts: M.sgSmooth || [], line: true, color: '#2563eb', w: 2 }, { pts: M.sgManual, line: old, dots: true, color: old ? '#2563eb' : '#111827', w: 1.5, tip: p => 'SG ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
+  <div class="legend muted"><span><i style="background:#93c5fd"></i>Pill raw</span><span><i style="background:#2563eb"></i>Pill smoothed (5 pts)</span><span><i style="background:#111827"></i>Manual</span>${M.T.length || old ? '' : '<span>No Pill data yet</span>'}</div>`;
+  const pv = M.ph.map(p => p[1]).concat((M.adj || []).map(p => p[1])), pLo = Math.min(3, ...pv) - 0.1, pHi = Math.max(5.6, ...pv) + 0.1;
+  h += `<h3>pH</h3>${chart({ label: 'pH against time since pitch', x0: 0, x1, y0: pLo, y1: pHi, yd: 1, xt, xf, xl: 'days since pitch', bands: [{ y0: setting('ph_min', 4), y1: setting('ph_ceiling', 5), color: '#16a34a' }], vlines: [...base, { x: setting('ph_protect_hours', 72), color: '#888', label: 'buffer window ends', row: 2 }], series: [{ pts: M.ph, line: true, dots: true, color: '#16a34a', tip: p => 'pH ' + p[1] + ' at ' + (p[0] / 24).toFixed(1) + ' d' }, { pts: M.adj || [], dots: true, color: '#111827', r: 4, tip: p => 'adjusted start pH ' + p[1] }] })}
+  <div class="legend muted"><span><i style="background:#16a34a;opacity:.4"></i>pH ${setting('ph_min', 4)}–${setting('ph_ceiling', 5)} band</span>${old && M.adj.length ? '<span><i style="background:#111827"></i>adjusted starting pH</span>' : ''}${Object.keys(IV_COL).map(k => `<span><i style="background:${IV_COL[k]}"></i>${k}</span>`).join('')}</div>`;
+  if (!old && ((M.tempManual && M.tempManual.length) || (M.tempRaw && M.tempRaw.length))) {
+    const tv = M.tempManual.concat(M.tempRaw).map(p => p[1]), tMax = setting('temp_max_c', 34), tLo = Math.min(...tv, 20) - 1, tHi = Math.max(...tv, tMax) + 2;
+    h += `<h3>Temperature</h3>${chart({ label: 'Temperature against time since pitch', x0: 0, x1, y0: tLo, y1: tHi, yd: 0, xt, xf, xl: 'days since pitch', bands: [{ y0: tMax, y1: tHi, color: '#dc2626' }], vlines: base, series: [{ pts: M.tempRaw, line: true, color: '#fca5a5', w: 1, op: .8 }, { pts: M.tempSmooth, line: true, color: '#dc2626', w: 2 }, { pts: M.tempManual, dots: true, color: '#111827', tip: p => p[1] + ' °C at ' + (p[0] / 24).toFixed(1) + ' d' }] })}
+    <div class="legend muted"><span><i style="background:#fca5a5"></i>Pill raw</span><span><i style="background:#dc2626"></i>Pill smoothed</span><span><i style="background:#111827"></i>Manual</span><span><i style="background:#dc2626;opacity:.3"></i>above ${tMax} °C</span></div>`;
+  }
+  if (old) h += `<p class="muted">Last season's readings are plotted as recorded: the 6 h to 48 h columns at those hours, then Day 3 at 72 h and so on at 24 h a day. Ending values sit at the day the batch was called done. Only batches 3.30 to 3.33 have readings during the ferment.${isNum(M.r.ph_day7_second_col) ? ' A second "pH Day 7" value (' + M.r.ph_day7_second_col + ') is not plotted because its time is unknown.' : ''}</p>`;
+  return h;
+}
+function detailGrid(pairs) { return `<div class="card" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:.7rem 1rem">${pairs.map(([k, v]) => `<div><div class="muted" style="font:400 .68rem var(--mono)">${esc(k)}</div><div style="font:500 .88rem var(--mono);word-break:break-word">${v === '' || v == null ? '–' : esc(v)}</div></div>`).join('')}</div>`; }
+function editHistory(tab, id) {
+  const L = S.editLog.filter(e => e.tab === tab && String(e.record_id) === String(id)).sort((a, c) => String(c.timestamp).localeCompare(String(a.timestamp)));
+  return `<h3>Edit history</h3>${L.length ? table(['When', 'Who', 'Field', 'Was', 'Now'], L.map(e => [fmtT(e.timestamp), e.edited_by, e.field, e.old_value, e.new_value])) : '<p class="muted">No edits since it was entered.</p>'}`;
+}
+function viewBatch(arg) {
+  const oldRoute = arg.indexOf('2025-26/') === 0, id = oldRoute ? arg.slice(8) : arg;
+  const bRow = oldRoute ? null : S.batches.find(x => String(x.batch_id) === id), M = oldRoute ? modelOld(id) : (bRow ? modelCur(bRow) : null);
+  if (!M) return `<p>Batch ${esc(id)} not found. <a href="#/all">All batches</a></p>`;
+  const src = M.kind === 'old' ? M.r : M.b, back = '<p><a href="#/all">← All batches</a> · <a href="#/today">Today</a></p>';
+  let h = back + `<div class="row"><h2 style="flex:3;margin:0">${esc(M.id)} <span class="muted">${esc(src.vessel)} · ${esc(M.kind === 'old' ? (M.finished ? 'called done' : 'incomplete') : src.status)} · ${esc(M.season)}</span></h2>
+  <button class="primary" onclick="${M.kind === 'old' ? `openSeasonForm('${esc(M.id)}')` : `openBatchForm('${esc(M.id)}')`}">Edit batch</button>${M.kind === 'cur' ? `<button onclick="openReadingForm('${esc(M.id)}')">+ Reading</button><button onclick="openIvForm('${esc(M.id)}')">+ Intervention</button>` : ''}</div>
+  <div class="muted">${esc(src.spirit)} · ${esc(src.farm)} · ${esc(src.variety)} · ${esc(src.yeast)}${M.kind === 'cur' ? ' · pitched ' + esc(fmtT(src.pitch_time)) : ' · fermentation date ' + esc(src.ferment_date || '–')}</div>`;
+  h += batchKpis(M) + batchCharts(M);
+  if (M.kind === 'cur') {
+    const b = M.b, sib = S.batches.filter(x => b.pair_id && x.pair_id === b.pair_id && String(x.batch_id) !== M.id), kids = S.batches.filter(x => x.source_batch_id && String(x.source_batch_id) === M.id), srcB = b.source_batch_id ? S.batches.find(x => String(x.batch_id) === String(b.source_batch_id)) : null;
+    if (sib.length || kids.length || b.source_batch_id) h += `<h3>Pair and lineage</h3><div class="card">${sib.length ? 'Pair ' + esc(b.pair_id) + ': ' + sib.map(x => `<a href="${bLink(x.batch_id)}">${esc(x.batch_id)}</a>`).join(', ') + '<br>' : ''}${b.source_batch_id ? 'Pitched from a crop of ' + (srcB ? `<a href="${bLink(srcB.batch_id)}">${esc(srcB.batch_id)}</a>` : esc(b.source_batch_id)) + (isNum(b.repitch_generation) ? ' (generation ' + esc(b.repitch_generation) + ')' : '') + '<br>' : ''}${kids.length ? 'Crop used to pitch: ' + kids.map(x => `<a href="${bLink(x.batch_id)}">${esc(x.batch_id)}</a>`).join(', ') : ''}</div>`;
+    h += `<h3>Details</h3>${detailGrid(Object.keys(b).filter(k => k !== 'notes').map(k => [k, /_time$/.test(k) ? (b[k] ? fmtT(b[k]) : '') : b[k]]))}`;
+    if (b.notes) h += `<h3>Notes</h3><div class="card">${esc(b.notes)}</div>`;
+    h += `<h3>Readings <button class="small" onclick="csvReadings('${esc(M.id)}')">CSV</button></h3>${table(['Time', 'Hours', 'pH', 'SG', 'Temp °C', 'By', 'Notes'], M.R.slice().reverse().map(r => [fmtT(r.timestamp), M.hasPitch ? f((new Date(r.timestamp) - new Date(b.pitch_time)) / 36e5, 1) : '–', f(r.ph, 2), f(r.sg, 3), f(r.temperature_c, 1), r.entered_by, r.notes]))}
+    <h3>Interventions</h3>${table(['Time', 'Hours', 'Type', 'Product', 'Amount', 'By', 'Notes'], M.I.slice().reverse().map(r => [fmtT(r.timestamp), M.hasPitch ? f((new Date(r.timestamp) - new Date(b.pitch_time)) / 36e5, 1) : '–', r.type, r.product, (r.amount === '' ? '' : r.amount + ' ' + r.unit), r.entered_by, r.notes]))}`;
+    h += editHistory('Batches', M.id);
+  } else {
+    const r = M.r, skip = ['source_row', 'notes', 'dq_flags'].concat(SG_COLS.map(x => x[0]), PH_COLS.map(x => x[0]), ['ph_day7_second_col']);
+    h += `<h3>Details</h3>${detailGrid(Object.keys(r).filter(k => skip.indexOf(k) < 0).map(k => [k, r[k]]))}`;
+    if (r.notes) h += `<h3>Notes</h3><div class="card">${esc(r.notes)}</div>`;
+    if (r.dq_flags) h += `<h3>Data quality flags</h3><div class="card">${String(r.dq_flags).split('; ').map(x => `<div>${esc(x)}</div>`).join('')}</div>`;
+    const hrsAll = [...new Set(SG_COLS.concat(PH_COLS).filter(([k]) => isNum(r[k])).map(x => x[1]))].sort((a, c) => a - c), cell = (cols, h2) => { const c = cols.find(x => x[1] === h2 && isNum(r[x[0]])); return c ? r[c[0]] : ''; };
+    h += `<h3>Recorded readings</h3>${hrsAll.length ? table(['Hours since pitch', 'SG', 'pH'], hrsAll.map(x => [x, cell(SG_COLS, x), cell(PH_COLS, x)])) : '<p class="muted">No readings were recorded during the ferment. Only the starting and ending values exist.</p>'}`;
+    h += editHistory('Season 2025-26', M.id);
+  }
   return h;
 }
 const table = (heads, rows) => rows.length ? `<div class="tablewrap"><table><thead><tr>${heads.map(x => `<th>${esc(x)}</th>`).join('')}</tr></thead><tbody>${rows.map(r => `<tr>${r.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '<p class="muted">None yet.</p>';
@@ -269,8 +348,8 @@ const table = (heads, rows) => rows.length ? `<div class="tablewrap"><table><the
 /* ============ VIEW: all batches ============ */
 function allRows() {
   const cur = S.batches.map(b => { const fin = b.finish_time && b.pitch_time ? hrs(b.pitch_time, b.finish_time) / 24 : null; const el = !fin && b.pitch_time ? hrs(b.pitch_time, new Date()) / 24 : null;
-    return { batch_id: String(b.batch_id), season: b.season || '2026-27', spirit: b.spirit, farm: b.farm, variety: b.variety, yeast: b.yeast, vessel: b.vessel, pair_id: b.pair_id, status: b.status, pitch: b.pitch_time, finish: b.finish_time, days: fin, elapsed: el, og: b.og_after_dilution || b.juice_sg, end_sg: b.ending_sg, cut: b.cut_time }; });
-  const old = S.season.map(r => ({ batch_id: String(r.batch_id), season: '2025-26', spirit: r.spirit, farm: r.farm, variety: r.variety, yeast: r.yeast, vessel: r.vessel, pair_id: '', status: r.finish_date_called ? 'called' : 'incomplete', pitch: r.ferment_date, finish: r.finish_date_called, days: isNum(r.days_to_called_finish) ? Number(r.days_to_called_finish) : null, elapsed: null, og: r.sg_juice, end_sg: r.ending_sg, delivery: r.delivery_date }));
+    return { src: 'cur', batch_id: String(b.batch_id), season: b.season || '2026-27', spirit: b.spirit, farm: b.farm, variety: b.variety, yeast: b.yeast, vessel: b.vessel, pair_id: b.pair_id, status: b.status, pitch: b.pitch_time, finish: b.finish_time, days: fin, elapsed: el, og: b.og_after_dilution || b.juice_sg, end_sg: b.ending_sg, cut: b.cut_time }; });
+  const old = S.season.map(r => ({ src: 'old', batch_id: String(r.batch_id), season: '2025-26', spirit: r.spirit, farm: r.farm, variety: r.variety, yeast: r.yeast, vessel: r.vessel, pair_id: '', status: r.finish_date_called ? 'called' : 'incomplete', pitch: r.ferment_date, finish: r.finish_date_called, days: isNum(r.days_to_called_finish) ? Number(r.days_to_called_finish) : null, elapsed: null, og: r.sg_juice, end_sg: r.ending_sg, delivery: r.delivery_date }));
   return cur.concat(old);
 }
 const ALLCOLS = [['batch_id', 'Batch'], ['season', 'Season'], ['spirit', 'Spirit'], ['farm', 'Farm'], ['variety', 'Variety'], ['yeast', 'Yeast'], ['vessel', 'Vessel'], ['pair_id', 'Pair'], ['status', 'Status'], ['pitch', 'Pitched'], ['days', 'Days to finish'], ['og', 'OG / juice SG'], ['end_sg', 'Ending SG']];
@@ -286,7 +365,7 @@ function viewAll() {
   let h = `<div class="row" style="margin-bottom:.6rem"><h2 style="margin:0;flex:2">All batches <span class="muted">(${rows.length})</span></h2><button onclick="csvAll()">Export CSV</button></div>
   <div class="row"><div><label>Search</label><input id="fq" value="${esc(S.flt.q)}"></div><div><label>Season</label><select id="fs"><option value="">All</option>${opts('season')}</select></div><div><label>Status</label><select id="fst"><option value="">All</option>${opts('status')}</select></div><div><label>&nbsp;</label><label style="display:flex;gap:.4rem;align-items:center;margin:0;padding:.45rem 0"><input type="checkbox" id="fg" style="width:auto" ${S.flt.group ? 'checked' : ''}> Group by pair</label></div></div><div style="height:.6rem"></div>`;
   const head = ALLCOLS.map(([k, l]) => `<th data-k="${k}">${esc(l)}${S.sort.key === k ? (S.sort.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('');
-  const cell = (r, k) => k === 'pitch' ? fmtT(r.pitch) : k === 'days' ? (r.days != null ? f(r.days, 1) : (r.elapsed != null ? f(r.elapsed, 1) + ' (running)' : '–')) : k === 'og' || k === 'end_sg' ? f(r[k], 3) : k === 'batch_id' && r.season === '2026-27' ? `<a href="#/batch/${encodeURIComponent(r.batch_id)}">${esc(r.batch_id)}</a>` : esc(r[k]);
+  const cell = (r, k) => k === 'pitch' ? fmtT(r.pitch) : k === 'days' ? (r.days != null ? f(r.days, 1) : (r.elapsed != null ? f(r.elapsed, 1) + ' (running)' : '–')) : k === 'og' || k === 'end_sg' ? f(r[k], 3) : k === 'batch_id' ? `<a href="${bLink(r.batch_id, r.src === 'old' ? '2025-26' : '')}">${esc(r.batch_id)}</a>` : esc(r[k]);
   let body = ''; let last = null;
   rows.forEach(r => { if (S.flt.group && r.pair_id !== last) { body += `<tr class="grp"><td colspan="${ALLCOLS.length}">${r.pair_id ? 'Pair ' + esc(r.pair_id) : 'No pair'}</td></tr>`; last = r.pair_id; } body += `<tr>${ALLCOLS.map(([k]) => `<td>${cell(r, k)}</td>`).join('')}</tr>`; });
   return h + `<div class="tablewrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
@@ -368,7 +447,7 @@ function bindSettings() {
 const who = () => { if (!cfg.name) { const n = prompt('Your name (saved with each entry):'); if (n) { cfg.name = n.trim(); saveCfg(); } } if (!cfg.name) throw new Error('A name is needed to save entries.'); return cfg.name; };
 const nowLocal = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
 const toIso = v => v ? new Date(v).toISOString() : '';
-const opt = (arr, sel) => `<option value=""></option>` + (arr || []).map(v => `<option ${v === sel ? 'selected' : ''}>${esc(v)}</option>`).join('');
+const opt = (arr, sel) => `<option value=""></option>` + (arr || []).map(v => `<option ${v === sel ? 'selected' : ''}>${esc(v)}</option>`).join('') + (sel && (arr || []).indexOf(sel) < 0 ? `<option selected>${esc(sel)}</option>` : '');
 function dlg(html, onsave) {
   const d = $('#dlg'); d.innerHTML = `<form method="dialog" id="df">${html}<div id="de" class="bad-t" style="margin-top:.5rem"></div><div class="row" style="margin-top:.8rem"><button type="button" id="dx">Cancel</button><button class="primary" id="ds" type="submit">Save</button></div></form>`;
   d.showModal(); $('#dx').onclick = () => d.close();
@@ -386,18 +465,85 @@ function openIvForm(bid) {
   <p class="muted">Log what was actually added, not what the calculator recommended.</p>`,
     () => api('addIntervention', { row: { batch_id: bid, timestamp: toIso(val('f_t')), type: val('f_ty'), product: val('f_p'), amount: val('f_a'), unit: val('f_u'), notes: val('f_n'), entered_by: who() } }));
 }
+/* --- new batch / edit batch --- */
+const ADD_KEYS = ['spirit', 'farm', 'variety', 'yeast', 'vessel']; // dropdowns people can extend from the form
+const TIMES = (() => { const a = []; for (let h = 0; h < 24; h++) for (let m = 0; m < 60; m += 15) a.push(String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0')); return a; })();
+function bkkParts(iso) { const p = {}; new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(iso)).forEach(x => { p[x.type] = x.value; }); return { d: `${p.year}-${p.month}-${p.day}`, t: `${p.hour}:${p.minute}` }; }
+function nowSlot() { const n = bkkParts(new Date().toISOString()); const [h, m] = n.t.split(':').map(Number); return { d: n.d, t: String(h).padStart(2, '0') + ':' + String(Math.floor(m / 15) * 15).padStart(2, '0') }; } // current date, time rounded down to 15 min
+function nextBatchId() {
+  const mine = S.batches.map(b => /^(\d+)\.(\d+)$/.exec(String(b.batch_id))).filter(Boolean).map(m => [+m[1], +m[2]]).sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+  if (mine.length) { const l = mine[mine.length - 1]; return l[0] + '.' + String(l[1] + 1).padStart(2, '0'); }
+  const old = S.season.map(r => /^(\d+)\./.exec(String(r.batch_id))).filter(Boolean).map(m => +m[1]); // first batch of the season: next series after last season's
+  return (old.length ? Math.max(...old) + 1 : 1) + '.01';
+}
+function dtField(k, label, iso, useNow) {
+  const v = iso ? bkkParts(iso) : (useNow ? nowSlot() : { d: '', t: '' });
+  const times = !v.t || TIMES.indexOf(v.t) >= 0 ? TIMES : TIMES.concat([v.t]).sort();
+  return `<div><label>${label}</label><div class="dt"><input id="b_${k}_d" type="date" value="${v.d}"><select id="b_${k}_t"><option value=""></option>${times.map(x => `<option ${x === v.t ? 'selected' : ''}>${x}</option>`).join('')}</select></div></div>`;
+}
+const dtVal = k => { const d = val('b_' + k + '_d'), t = val('b_' + k + '_t'); return d ? `${d}T${t || '00:00'}:00+07:00` : ''; }; // Bangkok has no daylight saving, so +07:00 is always right
+function wireAdd(prefix) { // "＋ Add new…" in a dropdown adds a permanent option to the Lists tab for everyone
+  ADD_KEYS.forEach(k => {
+    const el = $('#' + prefix + k); if (!el) return; let prev = el.value;
+    el.onchange = async () => {
+      if (el.value !== '__new__') { prev = el.value; return; }
+      const v = prompt('New ' + k + ' (added to the dropdown for everyone):');
+      if (!v || !v.trim()) { el.value = prev; return; }
+      try {
+        const r = await api('addListOption', { list: k, value: v.trim(), enteredBy: who() });
+        S.lists[k] = S.lists[k] || []; if (S.lists[k].indexOf(r.value) < 0) S.lists[k].push(r.value);
+        el.innerHTML = opt(S.lists[k], r.value) + '<option value="__new__">＋ Add new…</option>'; el.value = r.value; prev = r.value;
+      } catch (e) { $('#de').textContent = e.message; el.value = prev; }
+    };
+  });
+}
+const selA = (p, k, arr, cur) => `<div><label>${k}</label><select id="${p}${k}">${opt(arr, cur)}${ADD_KEYS.indexOf(k) >= 0 ? '<option value="__new__">＋ Add new…</option>' : ''}</select></div>`;
+const inpA = (p, k, v, type, step) => `<div><label>${k}</label><input id="${p}${k}" type="${type || 'text'}" ${step ? 'step="' + step + '"' : ''} value="${esc(v)}"></div>`;
+
 function openBatchForm(id) {
   const b = id ? (S.batches.find(x => String(x.batch_id) === id) || {}) : {};
-  const loc = iso => { if (!iso) return ''; const d = new Date(iso); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
-  const L = S.lists, pills = S.pills.map(p => p.pill_id);
-  const sel = (k, arr) => `<div><label>${k}</label><select id="b_${k}">${opt(arr, b[k])}</select></div>`;
-  const inp = (k, type, step) => `<div><label>${k}</label><input id="b_${k}" type="${type || 'text'}" ${step ? 'step="' + step + '"' : ''} value="${esc(type === 'datetime-local' ? loc(b[k]) : b[k])}"></div>`;
-  dlg(`<h3>${id ? 'Edit ' + esc(id) : 'New batch'}</h3><div class="row">${id ? `<div><label>batch_id</label><input id="b_batch_id" value="${esc(id)}" readonly></div>` : inp('batch_id')}${inp('season')}</div>
-  <div class="row">${sel('spirit', L.spirit)}${sel('farm', L.farm)}${sel('variety', L.variety)}</div><div class="row">${sel('yeast', L.yeast)}${sel('vessel', L.vessel)}${sel('status', L.status)}</div>
-  <div class="row">${inp('pair_id')}${inp('source_batch_id')}${inp('repitch_generation', 'number', '1')}${sel('pill_id', pills)}</div>
-  <div class="row">${inp('cut_time', 'datetime-local')}${inp('delivery_time', 'datetime-local')}${inp('press_time', 'datetime-local')}${inp('pitch_time', 'datetime-local')}</div>
-  <div class="row">${inp('juice_volume_l', 'number', 'any')}${inp('juice_sg', 'number', '0.001')}${inp('juice_ph', 'number', '0.01')}${inp('water_added_l', 'number', 'any')}${inp('og_after_dilution', 'number', '0.001')}${inp('yeast_grams', 'number', 'any')}</div><label>notes</label><input id="b_notes" value="${esc(b.notes)}">`,
-    () => { const o = {}; ['batch_id', 'season', 'spirit', 'farm', 'variety', 'yeast', 'vessel', 'status', 'pair_id', 'source_batch_id', 'repitch_generation', 'pill_id', 'juice_volume_l', 'juice_sg', 'juice_ph', 'water_added_l', 'og_after_dilution', 'yeast_grams', 'notes'].forEach(k => { o[k] = val('b_' + k); }); ['cut_time', 'delivery_time', 'press_time', 'pitch_time'].forEach(k => { o[k] = toIso(val('b_' + k)); }); if (!o.season) o.season = '2026-27'; return api('saveBatch', { batch: o, enteredBy: who() }); });
+  const L = S.lists, pills = S.pills.map(p => p.pill_id), fresh = !id, P = 'b_';
+  const inp = (k, type, step) => inpA(P, k, b[k], type, step), sel = (k, arr, cur) => selA(P, k, arr, cur);
+  dlg(`<h3>${id ? 'Edit ' + esc(id) : 'New batch'}</h3><div class="row"><div><label>batch_id</label><input id="b_batch_id" value="${esc(id || nextBatchId())}" ${id ? 'readonly' : ''}></div>
+  <div><label>season</label><select id="b_season">${(L.season || ['2026-27']).map(v => `<option ${v === (b.season || '2026-27') ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></div></div>
+  <div class="row">${sel('spirit', L.spirit, b.spirit)}${sel('farm', L.farm, b.farm)}${sel('variety', L.variety, b.variety)}</div><div class="row">${sel('yeast', L.yeast, b.yeast)}${sel('vessel', L.vessel, b.vessel)}${sel('status', L.status, b.status)}</div>
+  <div class="row">${inp('pair_id')}${inp('source_batch_id')}${inp('repitch_generation', 'number', '1')}${sel('pill_id', pills, b.pill_id)}</div>
+  <div class="row">${dtField('cut_time', 'cut_time', b.cut_time, false)}${dtField('delivery_time', 'delivery_time', b.delivery_time, fresh)}</div>
+  <div class="row">${dtField('press_time', 'crush (press) time', b.press_time, fresh)}${dtField('pitch_time', 'pitch_time', b.pitch_time, fresh)}</div>
+  <div class="row">${inp('juice_volume_l', 'number', 'any')}${inp('juice_sg', 'number', '0.001')}${inp('juice_ph', 'number', '0.01')}${inp('water_added_l', 'number', 'any')}${inp('og_after_dilution', 'number', '0.001')}${inp('yeast_grams', 'number', 'any')}</div>
+  ${id ? `<h3>Finish</h3><div class="row">${dtField('finish_time', 'finish_time', b.finish_time, false)}${inp('ending_sg', 'number', '0.001')}${inp('ending_ph', 'number', '0.01')}<div><label>confirmed dry</label><select id="b_confirmed_dry"><option value="">No</option><option value="TRUE" ${b.confirmed_dry === true ? 'selected' : ''}>Yes</option></select></div></div>` : ''}
+  <label>notes</label><input id="b_notes" value="${esc(b.notes)}">`,
+    () => {
+      const o = {}; ['batch_id', 'season', 'spirit', 'farm', 'variety', 'yeast', 'vessel', 'status', 'pair_id', 'source_batch_id', 'repitch_generation', 'pill_id', 'juice_volume_l', 'juice_sg', 'juice_ph', 'water_added_l', 'og_after_dilution', 'yeast_grams', 'notes'].forEach(k => { const v = val('b_' + k); o[k] = v === '__new__' ? '' : v; });
+      ['cut_time', 'delivery_time', 'press_time', 'pitch_time'].forEach(k => { o[k] = dtVal(k); });
+      if (id) { o.finish_time = dtVal('finish_time'); o.ending_sg = val('b_ending_sg'); o.ending_ph = val('b_ending_ph'); o.confirmed_dry = val('b_confirmed_dry') === 'TRUE'; }
+      return api('saveBatch', { batch: o, enteredBy: who() });
+    });
+  wireAdd('b_');
+}
+
+/* edit a batch from last season (Season 2025-26 tab). Every change is logged with who, when, old and new value. */
+const OLD_NUMS = ['delivery_weight_kg', 'price_per_kg', 'approximate_weight', 'liquid_in_l', 'sg_juice', 'ph_juice', 'adjusted_start_ph', 'ending_sg', 'ending_ph'];
+const OLD_DATES = ['delivery_date', 'ferment_date', 'finish_date_called'];
+function openSeasonForm(id) {
+  const r = S.season.find(x => String(x.batch_id) === id); if (!r) return;
+  const L = S.lists, P = 'o_', allNums = SG_COLS.map(x => x[0]).concat(PH_COLS.map(x => x[0]), ['ph_day7_second_col']);
+  const num = k => inpA(P, k, r[k], 'number', 'any'), grid = ks => `<div class="row" style="gap:.4rem">${ks.map(k => `<div style="flex:1 1 90px"><label>${k.replace(/^(sg|ph)_/, '$1 ')}</label><input id="${P}${k}" type="number" step="any" value="${esc(r[k])}"></div>`).join('')}</div>`;
+  const dateIn = k => `<div><label>${k}</label><input id="${P}${k}" type="date" value="${esc(r[k])}"></div>`;
+  dlg(`<h3>Edit ${esc(id)} <span class="muted">2025-26</span></h3><p class="muted">Changes are saved with your name and logged under Edit history.</p>
+  <div class="row">${selA(P, 'spirit', L.spirit, r.spirit)}${selA(P, 'farm', L.farm, r.farm)}${selA(P, 'variety', L.variety, r.variety)}</div><div class="row">${selA(P, 'yeast', L.yeast, r.yeast)}${selA(P, 'vessel', L.vessel, r.vessel)}</div>
+  <div class="row">${OLD_DATES.map(dateIn).join('')}</div>
+  <div class="row">${['delivery_weight_kg', 'price_per_kg', 'approximate_weight', 'liquid_in_l'].map(num).join('')}</div>
+  <div class="row">${['sg_juice', 'ph_juice', 'adjusted_start_ph', 'ending_sg', 'ending_ph'].map(num).join('')}</div>
+  <h3>SG readings</h3>${grid(SG_COLS.map(x => x[0]))}<h3>pH readings</h3>${grid(PH_COLS.map(x => x[0]).concat(['ph_day7_second_col']))}
+  <label>notes</label><input id="o_notes" value="${esc(r.notes)}">`,
+    () => {
+      const ch = {}, same = (a, b) => String(a == null ? '' : a) === String(b == null ? '' : b);
+      OLD_DATES.concat(OLD_NUMS, allNums, ['notes']).concat(ADD_KEYS.filter(k => k !== 'spirit' || true)).forEach(k => { const el = $('#' + P + k); if (!el) return; const v = el.value === '__new__' ? r[k] : el.value; if (!same(v, r[k])) ch[k] = v; });
+      if (!Object.keys(ch).length) throw new Error('No changes to save.');
+      return api('saveSeasonRow', { batch_id: id, changes: ch, enteredBy: who() });
+    });
+  wireAdd(P);
 }
 
 /* ============ alerts: worked out in the browser, shown as a bar ============ */
